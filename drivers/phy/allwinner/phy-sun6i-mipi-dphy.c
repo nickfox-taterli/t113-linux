@@ -630,6 +630,10 @@ static const struct of_device_id sun6i_dphy_of_table[] = {
 		.compatible	= "allwinner,sun50i-a100-mipi-dphy",
 		.data		= &sun50i_a100_mipi_dphy_variant,
 	},
+	{
+		.compatible	= "allwinner,sun20i-d1-mipi-dphy",
+		.data		= &sun50i_a100_mipi_dphy_variant,
+	},
 	{ }
 };
 MODULE_DEVICE_TABLE(of, sun6i_dphy_of_table);

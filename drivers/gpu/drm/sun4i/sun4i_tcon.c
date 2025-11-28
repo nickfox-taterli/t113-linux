@@ -1323,7 +1323,21 @@ static int sun4i_tcon_probe(struct platform_device *pdev)
 
 	/* panels and bridges are present only on TCONs with channel 0 */
 	if (quirks->has_channel_0) {
+		struct device_node *remote;
+
 		ret = drm_of_find_panel_or_bridge(node, 1, 0, &panel, &bridge);
+		if (ret == -ENOENT)
+			ret = drm_of_find_panel_or_bridge(node, 1, 1,
+							  &panel, &bridge);
+		if (ret == -EPROBE_DEFER) {
+			/* DSI endpoint isn't a panel/bridge: don't defer forever */
+			remote = of_graph_get_remote_node(node, 1, 0);
+			if (remote &&
+			    (of_device_is_compatible(remote, "allwinner,sun20i-d1-mipi-dsi") ||
+			     of_device_is_compatible(remote, "allwinner,sun50i-a100-mipi-dsi")))
+				ret = 0;
+			of_node_put(remote);
+		}
 		if (ret == -EPROBE_DEFER)
 			return ret;
 	}

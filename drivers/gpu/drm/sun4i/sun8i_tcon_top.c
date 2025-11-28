@@ -121,6 +121,13 @@ static struct clk_hw *sun8i_tcon_top_register_gate(struct device *dev,
 				    bit, 0, lock);
 };
 
+static int sun8i_tcon_top_dummy_bind(struct device *dev,
+                                     struct device *master,
+                                     void *data)
+{
+    return 0;
+}
+
 static int sun8i_tcon_top_bind(struct device *dev, struct device *master,
 			       void *data)
 {
@@ -251,13 +258,32 @@ static void sun8i_tcon_top_unbind(struct device *dev, struct device *master,
 }
 
 static const struct component_ops sun8i_tcon_top_ops = {
-	.bind	= sun8i_tcon_top_bind,
+	.bind	= sun8i_tcon_top_dummy_bind,
 	.unbind	= sun8i_tcon_top_unbind,
 };
 
 static int sun8i_tcon_top_probe(struct platform_device *pdev)
 {
-	return component_add(&pdev->dev, &sun8i_tcon_top_ops);
+    int ret;
+
+    dev_info(&pdev->dev, "sun8i_tcon_top_probe\n");
+
+    /* 正常注册成一个 DRM component */
+    ret = component_add(&pdev->dev, &sun8i_tcon_top_ops);
+    if (ret)
+        return ret;
+
+    /*
+     * 关键：手动调用真正的 bind，把 gate clock 等都注册掉，
+     * 这样后面的 DSI probe 时 devm_clk_get("mod") 就不会再找不到。
+     */
+    ret = sun8i_tcon_top_bind(&pdev->dev, NULL, NULL);
+    if (ret) {
+        component_del(&pdev->dev, &sun8i_tcon_top_ops);
+        return ret;
+    }
+
+    return 0;
 }
 
 static void sun8i_tcon_top_remove(struct platform_device *pdev)

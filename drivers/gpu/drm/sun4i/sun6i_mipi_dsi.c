@@ -20,6 +20,7 @@
 #include <linux/slab.h>
 
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_bridge.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_panel.h>
 #include <drm/drm_print.h>
@@ -198,6 +199,8 @@ enum sun6i_dsi_inst_escape {
 	DSI_INST_ESCA_UN4,
 	DSI_INST_ESCA_UN5,
 };
+
+static int sun6i_dsi_init_panel_connector(struct sun6i_dsi *dsi);
 
 enum sun6i_dsi_inst_packet {
 	DSI_INST_PACK_PIXEL	= 0,
@@ -963,19 +966,56 @@ static int sun6i_dsi_attach(struct mipi_dsi_host *host,
 			    struct mipi_dsi_device *device)
 {
 	struct sun6i_dsi *dsi = host_to_sun6i_dsi(host);
-	struct drm_panel *panel = of_drm_find_panel(device->dev.of_node);
+	struct drm_panel *panel;
+	struct drm_bridge *bridge;
+	int ret;
 
-	if (IS_ERR(panel))
-		return PTR_ERR(panel);
+	dev_info(host->dev, "sun6i_dsi_attach: device %s node %pOF\n",
+		 device->name, device->dev.of_node);
+
+	panel = of_drm_find_panel(device->dev.of_node);
+	if (IS_ERR(panel)) {
+		if (PTR_ERR(panel) == -EPROBE_DEFER)
+			panel = NULL; /* not a panel (e.g. bridge), keep trying */
+		else
+			panel = NULL;
+	}
+
 	if (!dsi->drm || !dsi->drm->registered)
 		return -EPROBE_DEFER;
 
-	dsi->panel = panel;
+	if (panel) {
+		ret = sun6i_dsi_init_panel_connector(dsi);
+		if (ret)
+			return ret;
+
+		dsi->panel = panel;
+		dsi->device = device;
+
+		drm_kms_helper_hotplug_event(dsi->drm);
+
+		dev_info(host->dev, "Attached panel device %s\n", device->name);
+		return 0;
+	}
+
+	bridge = of_drm_find_bridge(device->dev.of_node);
+	dev_info(host->dev, "sun6i_dsi_attach: bridge lookup -> %p\n", bridge);
+	if (!bridge)
+		return -EPROBE_DEFER;
+
+	/* Let the terminal bridge (lt8912) create the connector */
+	ret = drm_bridge_attach(&dsi->encoder, bridge, NULL, 0);
+	if (ret) {
+		dev_err(host->dev, "Failed to attach bridge (%d)\n", ret);
+		return ret;
+	}
+
+	dsi->bridge = bridge;
 	dsi->device = device;
 
 	drm_kms_helper_hotplug_event(dsi->drm);
 
-	dev_info(host->dev, "Attached device %s\n", device->name);
+	dev_info(host->dev, "Attached DSI bridge %s\n", device->name);
 
 	return 0;
 }
@@ -986,9 +1026,36 @@ static int sun6i_dsi_detach(struct mipi_dsi_host *host,
 	struct sun6i_dsi *dsi = host_to_sun6i_dsi(host);
 
 	dsi->panel = NULL;
+	dsi->bridge = NULL;
 	dsi->device = NULL;
 
 	drm_kms_helper_hotplug_event(dsi->drm);
+
+	return 0;
+}
+
+static int sun6i_dsi_init_panel_connector(struct sun6i_dsi *dsi)
+{
+	int ret;
+
+	if (dsi->connector.dev)
+		return 0;
+
+	drm_connector_helper_add(&dsi->connector,
+				 &sun6i_dsi_connector_helper_funcs);
+	ret = drm_connector_init(dsi->drm, &dsi->connector,
+				 &sun6i_dsi_connector_funcs,
+				 DRM_MODE_CONNECTOR_DSI);
+	if (ret)
+		return ret;
+
+	if (!dsi->connector.state) {
+		drm_atomic_helper_connector_reset(&dsi->connector);
+		if (!dsi->connector.state)
+			return -ENOMEM;
+	}
+
+	drm_connector_attach_encoder(&dsi->connector, &dsi->encoder);
 
 	return 0;
 }
@@ -1063,27 +1130,9 @@ static int sun6i_dsi_bind(struct device *dev, struct device *master,
 		return ret;
 	}
 	dsi->encoder.possible_crtcs = BIT(0);
-
-	drm_connector_helper_add(&dsi->connector,
-				 &sun6i_dsi_connector_helper_funcs);
-	ret = drm_connector_init(drm, &dsi->connector,
-				 &sun6i_dsi_connector_funcs,
-				 DRM_MODE_CONNECTOR_DSI);
-	if (ret) {
-		dev_err(dsi->dev,
-			"Couldn't initialise the DSI connector\n");
-		goto err_cleanup_connector;
-	}
-
-	drm_connector_attach_encoder(&dsi->connector, &dsi->encoder);
-
 	dsi->drm = drm;
 
 	return 0;
-
-err_cleanup_connector:
-	drm_encoder_cleanup(&dsi->encoder);
-	return ret;
 }
 
 static void sun6i_dsi_unbind(struct device *dev, struct device *master,
@@ -1110,6 +1159,8 @@ static int sun6i_dsi_probe(struct platform_device *pdev)
 	variant = device_get_match_data(dev);
 	if (!variant)
 		return -EINVAL;
+
+	dev_info(dev, "sun6i_mipi_dsi probe start\n");
 
 	dsi = devm_kzalloc(dev, sizeof(*dsi), GFP_KERNEL);
 	if (!dsi)
@@ -1223,6 +1274,13 @@ static const struct sun6i_dsi_variant sun50i_a64_mipi_dsi_variant = {
 
 static const struct sun6i_dsi_variant sun50i_a100_mipi_dsi_variant = {
 	.has_mod_clk	= true,
+	.set_mod_clk	= true,
+};
+
+/* D1 / T113 share the A100-style DSI (bus + mod clocks) */
+static const struct sun6i_dsi_variant sun20i_d1_mipi_dsi_variant = {
+	.has_mod_clk	= true,
+	.set_mod_clk	= true,
 };
 
 static const struct of_device_id sun6i_dsi_of_table[] = {
@@ -1237,6 +1295,10 @@ static const struct of_device_id sun6i_dsi_of_table[] = {
 	{
 		.compatible	= "allwinner,sun50i-a100-mipi-dsi",
 		.data		= &sun50i_a100_mipi_dsi_variant,
+	},
+	{
+		.compatible	= "allwinner,sun20i-d1-mipi-dsi",
+		.data		= &sun20i_d1_mipi_dsi_variant,
 	},
 	{ }
 };

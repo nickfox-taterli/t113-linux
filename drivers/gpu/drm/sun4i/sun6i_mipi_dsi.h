@@ -24,6 +24,7 @@ struct sun6i_dsi {
 	struct drm_connector	connector;
 	struct drm_encoder	encoder;
 	struct mipi_dsi_host	host;
+	struct drm_bridge	*bridge;
 
 	struct clk		*bus_clk;
 	struct clk		*mod_clk;

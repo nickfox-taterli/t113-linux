@@ -9,6 +9,7 @@
 #include <linux/i2c.h>
 #include <linux/media-bus-format.h>
 #include <linux/regmap.h>
+#include <linux/string.h>
 
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_atomic_helper.h>
@@ -47,6 +48,8 @@ struct lt8912 {
 
 	u8 data_lanes;
 	bool is_power_on;
+	bool dsi_attached;
+	bool force_mode;
 };
 
 static int lt8912_write_init_config(struct lt8912 *lt)
@@ -407,7 +410,10 @@ lt8912_connector_detect(struct drm_connector *connector, bool force)
 {
 	struct lt8912 *lt = connector_to_lt8912(connector);
 
-	if (lt->hdmi_port->ops & DRM_BRIDGE_OP_DETECT)
+	if (lt->force_mode || !lt->hdmi_port)
+		return connector_status_connected;
+
+	if (lt->hdmi_port && lt->hdmi_port->ops & DRM_BRIDGE_OP_DETECT)
 		return drm_bridge_detect(lt->hdmi_port, connector);
 
 	return lt8912_check_cable_status(lt);
@@ -428,6 +434,28 @@ static int lt8912_connector_get_modes(struct drm_connector *connector)
 	struct lt8912 *lt = connector_to_lt8912(connector);
 	u32 bus_format = MEDIA_BUS_FMT_RGB888_1X24;
 	int ret, num;
+
+	if (lt->force_mode) {
+		struct drm_display_mode *mode;
+
+		mode = drm_mode_create(connector->dev);
+		if (!mode)
+			return 0;
+
+		drm_display_mode_from_videomode(&lt->mode, mode);
+		mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+		drm_mode_set_name(mode);
+		drm_mode_probed_add(connector, mode);
+
+		ret = drm_display_info_set_bus_formats(&connector->display_info,
+						       &bus_format, 1);
+		if (ret < 0)
+			return 0;
+
+		connector->display_info.is_hdmi = true;
+
+		return 1;
+	}
 
 	drm_edid = drm_bridge_edid_read(lt->hdmi_port, connector);
 	drm_edid_connector_update(connector, drm_edid);
@@ -471,14 +499,24 @@ static int lt8912_attach_dsi(struct lt8912 *lt)
 	struct mipi_dsi_host *host;
 	struct mipi_dsi_device *dsi;
 	int ret = -1;
-	const struct mipi_dsi_device_info info = { .type = "lt8912",
-						   .channel = 0,
-						   .node = NULL,
-						 };
+	struct mipi_dsi_device_info info = {
+		.type = "lt8912",
+		.channel = 0,
+		.node = NULL,
+	};
+
+	if (lt->dsi_attached)
+		return 0;
 
 	host = of_find_mipi_dsi_host_by_node(lt->host_node);
 	if (!host)
-		return dev_err_probe(dev, -EPROBE_DEFER, "failed to find dsi host\n");
+		return dev_err_probe(dev, -EPROBE_DEFER,
+				     "failed to find dsi host (node %pOF)\n",
+				     lt->host_node);
+	dev_info(dev, "found DSI host: %s (%pOF)\n",
+		 dev_name(host->dev), host->dev->of_node);
+
+	info.node = lt->dev->of_node;
 
 	dsi = devm_mipi_dsi_device_register_full(dev, host, &info);
 	if (IS_ERR(dsi)) {
@@ -498,9 +536,11 @@ static int lt8912_attach_dsi(struct lt8912 *lt)
 
 	ret = devm_mipi_dsi_attach(dev, dsi);
 	if (ret < 0) {
-		dev_err(dev, "failed to attach dsi to host\n");
-		return ret;
+		return dev_err_probe(dev, ret, "failed to attach dsi to host\n");
 	}
+
+	dev_info(dev, "Attached to DSI host with %u lanes\n", dsi->lanes);
+	lt->dsi_attached = true;
 
 	return 0;
 }
@@ -518,8 +558,9 @@ static int lt8912_bridge_connector_init(struct drm_bridge *bridge)
 	int ret;
 	struct lt8912 *lt = bridge_to_lt8912(bridge);
 	struct drm_connector *connector = &lt->connector;
+	bool has_hpd = lt->hdmi_port && lt->hdmi_port->ops & DRM_BRIDGE_OP_HPD;
 
-	if (lt->hdmi_port->ops & DRM_BRIDGE_OP_HPD) {
+	if (has_hpd) {
 		drm_bridge_hpd_enable(lt->hdmi_port, lt8912_bridge_hpd_cb, lt);
 		connector->polled = DRM_CONNECTOR_POLL_HPD;
 	} else {
@@ -529,11 +570,19 @@ static int lt8912_bridge_connector_init(struct drm_bridge *bridge)
 
 	ret = drm_connector_init(bridge->dev, connector,
 				 &lt8912_connector_funcs,
-				 lt->hdmi_port->type);
+				 DRM_MODE_CONNECTOR_HDMIA);
 	if (ret)
 		goto exit;
 
 	drm_connector_helper_add(connector, &lt8912_connector_helper_funcs);
+
+	if (!connector->state) {
+		drm_atomic_helper_connector_reset(connector);
+		if (!connector->state) {
+			ret = -ENOMEM;
+			goto exit;
+		}
+	}
 
 	connector->dpms = DRM_MODE_DPMS_OFF;
 	drm_connector_attach_encoder(connector, bridge->encoder);
@@ -547,13 +596,16 @@ static int lt8912_bridge_attach(struct drm_bridge *bridge,
 				enum drm_bridge_attach_flags flags)
 {
 	struct lt8912 *lt = bridge_to_lt8912(bridge);
+	bool has_next = lt->hdmi_port != NULL;
 	int ret;
 
-	ret = drm_bridge_attach(encoder, lt->hdmi_port, bridge,
-				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
-	if (ret < 0) {
-		dev_err(lt->dev, "Failed to attach next bridge (%d)\n", ret);
-		return ret;
+	if (has_next) {
+		ret = drm_bridge_attach(encoder, lt->hdmi_port, bridge,
+					DRM_BRIDGE_ATTACH_NO_CONNECTOR);
+		if (ret < 0) {
+			dev_err(lt->dev, "Failed to attach next bridge (%d)\n", ret);
+			return ret;
+		}
 	}
 
 	if (!(flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR)) {
@@ -585,7 +637,8 @@ static void lt8912_bridge_detach(struct drm_bridge *bridge)
 
 	lt8912_hard_power_off(lt);
 
-	if (lt->connector.dev && lt->hdmi_port->ops & DRM_BRIDGE_OP_HPD)
+	if (lt->connector.dev && lt->hdmi_port &&
+	    lt->hdmi_port->ops & DRM_BRIDGE_OP_HPD)
 		drm_bridge_hpd_disable(lt->hdmi_port);
 }
 
@@ -611,7 +664,10 @@ lt8912_bridge_detect(struct drm_bridge *bridge, struct drm_connector *connector)
 {
 	struct lt8912 *lt = bridge_to_lt8912(bridge);
 
-	if (lt->hdmi_port->ops & DRM_BRIDGE_OP_DETECT)
+	if (lt->force_mode || !lt->hdmi_port)
+		return connector_status_connected;
+
+	if (lt->hdmi_port && lt->hdmi_port->ops & DRM_BRIDGE_OP_DETECT)
 		return drm_bridge_detect(lt->hdmi_port, connector);
 
 	return lt8912_check_cable_status(lt);
@@ -622,11 +678,14 @@ static const struct drm_edid *lt8912_bridge_edid_read(struct drm_bridge *bridge,
 {
 	struct lt8912 *lt = bridge_to_lt8912(bridge);
 
+	if (lt->force_mode)
+		return NULL;
+
 	/*
 	 * edid must be read through the ddc bus but it must be
 	 * given to the hdmi connector node.
 	 */
-	if (lt->hdmi_port->ops & DRM_BRIDGE_OP_EDID)
+	if (lt->hdmi_port && lt->hdmi_port->ops & DRM_BRIDGE_OP_EDID)
 		return drm_bridge_edid_read(lt->hdmi_port, connector);
 
 	dev_warn(lt->dev, "The connected bridge does not supports DRM_BRIDGE_OP_EDID\n");
@@ -685,6 +744,71 @@ static int lt8912_get_regulators(struct lt8912 *lt)
 				       lt->supplies);
 }
 
+static int lt8912_parse_force_mode(struct lt8912 *lt)
+{
+	struct videomode *vm = &lt->mode;
+	const char *force;
+
+	if (of_property_read_string(lt->dev->of_node, "lontium,force-mode", &force))
+		return 0;
+
+	memset(vm, 0, sizeof(*vm));
+
+	if (!strcmp(force, "720p30") || !strcmp(force, "1280x720p30")) {
+		vm->pixelclock = 37125000;
+		vm->hactive = 1280;
+		vm->hfront_porch = 110;
+		vm->hsync_len = 40;
+		vm->hback_porch = 220;
+		vm->vactive = 720;
+		vm->vfront_porch = 5;
+		vm->vsync_len = 5;
+		vm->vback_porch = 20;
+		vm->flags = DISPLAY_FLAGS_HSYNC_HIGH | DISPLAY_FLAGS_VSYNC_HIGH;
+	} else if (!strcmp(force, "720p60") || !strcmp(force, "1280x720p60")) {
+		vm->pixelclock = 74250000;
+		vm->hactive = 1280;
+		vm->hfront_porch = 110;
+		vm->hsync_len = 40;
+		vm->hback_porch = 220;
+		vm->vactive = 720;
+		vm->vfront_porch = 5;
+		vm->vsync_len = 5;
+		vm->vback_porch = 20;
+		vm->flags = DISPLAY_FLAGS_HSYNC_HIGH | DISPLAY_FLAGS_VSYNC_HIGH;
+	} else {
+		dev_warn(lt->dev, "Unsupported lontium,force-mode \"%s\"\n", force);
+		return 0;
+	}
+
+	lt->force_mode = true;
+	dev_info_once(lt->dev, "Forcing HDMI mode to %s\n", force);
+
+	return 0;
+}
+
+static struct device_node *lt8912_get_host_node(struct device *dev)
+{
+	struct device_node *ep, *host;
+
+	/* Optional explicit phandle override: allwinner,dsi = <&dsi>; */
+	host = of_parse_phandle(dev->of_node, "allwinner,dsi", 0);
+	if (host)
+		return host;
+
+	ep = of_graph_get_endpoint_by_regs(dev->of_node, 0, -1);
+	if (!ep) {
+		dev_warn(dev, "no endpoint@0 under lt8912 ports; cannot find DSI host\n");
+		return NULL;
+	}
+	host = of_graph_get_remote_port_parent(ep);
+	of_node_put(ep);
+
+	if (!host)
+		dev_warn(dev, "remote port parent missing for lt8912 endpoint\n");
+	return host; /* caller will of_node_put */
+}
+
 static int lt8912_parse_dt(struct lt8912 *lt)
 {
 	struct gpio_desc *gp_reset;
@@ -710,7 +834,7 @@ static int lt8912_parse_dt(struct lt8912 *lt)
 
 	lt->data_lanes = data_lanes;
 
-	lt->host_node = of_graph_get_remote_node(dev->of_node, 0, -1);
+	lt->host_node = lt8912_get_host_node(dev);
 	if (!lt->host_node) {
 		dev_err(lt->dev, "%s: Failed to get remote port\n", __func__);
 		return -ENODEV;
@@ -718,25 +842,25 @@ static int lt8912_parse_dt(struct lt8912 *lt)
 
 	port_node = of_graph_get_remote_node(dev->of_node, 1, -1);
 	if (!port_node) {
-		dev_err(lt->dev, "%s: Failed to get connector port\n", __func__);
-		ret = -ENODEV;
-		goto err_free_host_node;
+		dev_warn(lt->dev, "%s: No downstream connector, continuing headless\n", __func__);
+		goto skip_bridge_lookup;
 	}
 
 	lt->hdmi_port = of_drm_find_bridge(port_node);
 	if (!lt->hdmi_port) {
-		ret = -EPROBE_DEFER;
-		dev_err_probe(lt->dev, ret, "%s: Failed to get hdmi port\n", __func__);
-		goto err_free_host_node;
-	}
-
-	if (!of_device_is_compatible(port_node, "hdmi-connector")) {
+		dev_warn(lt->dev, "%s: No downstream HDMI connector/bridge, continuing without EDID/HPD\n", __func__);
+	} else if (!of_device_is_compatible(port_node, "hdmi-connector")) {
 		dev_err(lt->dev, "%s: Failed to get hdmi port\n", __func__);
 		ret = -EINVAL;
 		goto err_free_host_node;
 	}
 
+skip_bridge_lookup:
 	ret = lt8912_get_regulators(lt);
+	if (ret)
+		goto err_free_host_node;
+
+	ret = lt8912_parse_force_mode(lt);
 	if (ret)
 		goto err_free_host_node;
 
@@ -788,6 +912,8 @@ static int lt8912_probe(struct i2c_client *client)
 	ret = lt8912_attach_dsi(lt);
 	if (ret)
 		goto err_attach;
+
+	dev_info(dev, "lt8912 attached, lanes=%u\n", lt->data_lanes);
 
 	return 0;
 
